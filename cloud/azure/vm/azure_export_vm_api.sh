@@ -36,7 +36,12 @@ EOF
 }
 
 log() {
-  echo "[$(date +'%Y-%m-%dT%H:%M:%S%z')] $*"
+  local line
+  line="[$(date +'%Y-%m-%dT%H:%M:%S%z')] $*"
+  echo "$line"
+  if [[ -n "${VM_LOG_FILE:-}" ]]; then
+    printf "%s\n" "$line" >>"$VM_LOG_FILE" || true
+  fi
 }
 
 err() {
@@ -53,6 +58,7 @@ SA_CONTAINER=""
 SAS_HOURS=6
 DELETE_SNAPSHOTS="false"
 TAGS=""
+VM_TAG_FILTER=""
 
 if [[ $# -eq 0 ]]; then
   usage
@@ -79,6 +85,8 @@ while [[ $# -gt 0 ]]; do
       DELETE_SNAPSHOTS="$2"; shift 2 ;;
     --tags)
       TAGS="$2"; shift 2 ;;
+    --vm-tag-filter)
+      VM_TAG_FILTER="$2"; shift 2 ;;
     -h|--help)
       usage; exit 0 ;;
     *)
@@ -189,6 +197,7 @@ blob_request PUT "$CONTAINER_URL" >/dev/null || true
 export_disk() {
   local vm_name="$1"
   local disk_id="$2"
+  local vm_prefix="$3"
   local disk_name
   disk_name=$(basename "$disk_id")
 
@@ -233,7 +242,7 @@ export_disk() {
     return 1
   fi
 
-  local blob_name="${vm_name}_${disk_name}_$(timestamp).vhd"
+  local blob_name="${vm_prefix}/${disk_name}.vhd"
   local dest_blob_url="https://${SA_NAME}.blob.core.windows.net/${SA_CONTAINER}/${blob_name}"
   log "[$vm_name][$disk_name] Starting copy to ${blob_name}"
   blob_request PUT "$dest_blob_url" \
@@ -267,6 +276,10 @@ export_disk() {
 export_vm_disks() {
   local vm_rg="$1"
   local vm_name="$2"
+  # Ensure per-VM log file exists for this execution context
+  if [[ -z "${VM_LOG_FILE:-}" ]]; then
+    VM_LOG_FILE=$(mktemp)
+  fi
   log "Fetching VM: $vm_rg/$vm_name"
   local vm_url="${ARM_BASE}/subscriptions/${SUBSCRIPTION}/resourceGroups/${vm_rg}/providers/Microsoft.Compute/virtualMachines/${vm_name}?api-version=${ARM_API_VERSION_VM}"
   local vm_json
@@ -275,8 +288,24 @@ export_vm_disks() {
     err "VM $vm_name not found or unauthorized"
     return 1
   fi
+  if [[ -n "$VM_TAG_FILTER" ]]; then
+    local match
+    match=$(echo "$vm_json" | jq -r --arg filters "$VM_TAG_FILTER" '
+      def parse_filters($s): if ($s|length)==0 then {} else ($s | split(" ") | map(split("=")) | from_entries) end;
+      (parse_filters($filters)) as $f | ($f|keys) as $ks | (all($ks[]; (.tags[.] == $f[.])))
+    ')
+    if [[ "$match" != "true" ]]; then
+      log "[$vm_name] Skipped due to tag filter"
+      return 0
+    fi
+  fi
+  # Compute per-VM timestamped prefix (virtual subdirectory)
+  local vm_ts vm_prefix
+  vm_ts=$(timestamp)
+  vm_prefix="${vm_name}/${vm_ts}"
+
   # Upload VM configuration JSON into destination container
-  local config_blob_name="${vm_name}_config_$(timestamp).json"
+  local config_blob_name="${vm_prefix}/config.json"
   local config_blob_url="https://${SA_NAME}.blob.core.windows.net/${SA_CONTAINER}/${config_blob_name}"
   local config_payload
   config_payload=$(echo "$vm_json" | jq '.')
@@ -295,10 +324,24 @@ export_vm_disks() {
   for id in "${disk_ids[@]:-}"; do [[ -n "$id" ]] && all_ids+=("$id"); done
   log "[$vm_name] Disks to export: ${#all_ids[@]}"
   for id in "${all_ids[@]}"; do
-    export_disk "$vm_name" "$id" &
+    export_disk "$vm_name" "$id" "$vm_prefix" &
   done
   wait
   log "[$vm_name] Completed disk exports"
+
+  # Upload per-VM export log into the VM's directory
+  local log_blob_name="${vm_prefix}/export.log"
+  local log_blob_url="https://${SA_NAME}.blob.core.windows.net/${SA_CONTAINER}/${log_blob_name}"
+  if [[ -f "$VM_LOG_FILE" ]]; then
+    local log_len
+    log_len=$(wc -c <"$VM_LOG_FILE" | tr -d ' ')
+    blob_request PUT "$log_blob_url" \
+      -H "x-ms-blob-type: BlockBlob" \
+      -H "Content-Type: text/plain" \
+      -H "Content-Length: ${log_len}" \
+      --data-binary @"$VM_LOG_FILE" >/dev/null || true
+    rm -f "$VM_LOG_FILE" || true
+  fi
 }
 
 if [[ -n "$VM_NAME" ]]; then
@@ -306,28 +349,46 @@ if [[ -n "$VM_NAME" ]]; then
     err "--resource-group is required when --vm-name is provided"
     exit 1
   fi
-  export_vm_disks "$VM_RG" "$VM_NAME"
+  ( VM_LOG_FILE=$(mktemp); export VM_LOG_FILE; export_vm_disks "$VM_RG" "$VM_NAME" )
 else
   if [[ -n "$VM_RG" ]]; then
     log "Discovering VMs in resource group: $VM_RG"
     list_url="${ARM_BASE}/subscriptions/${SUBSCRIPTION}/resourceGroups/${VM_RG}/providers/Microsoft.Compute/virtualMachines?api-version=${ARM_API_VERSION_VM}"
     vm_list=$(auth_get "$list_url")
-    mapfile -t vms < <(echo "$vm_list" | jq -r '.value[].name')
+    if [[ -n "$VM_TAG_FILTER" ]]; then
+      mapfile -t vms < <(echo "$vm_list" | jq -r --arg filters "$VM_TAG_FILTER" '
+        def parse_filters($s): if ($s|length)==0 then {} else ($s | split(" ") | map(split("=")) | from_entries) end;
+        .value[] | select((parse_filters($filters)) as $f | ($f|keys) as $ks | all($ks[]; (.tags[.] == $f[.]))) | .name
+      ')
+    else
+      mapfile -t vms < <(echo "$vm_list" | jq -r '.value[].name')
+    fi
     if [[ ${#vms[@]} -eq 0 ]]; then
       err "No VMs found in resource group $VM_RG"
       exit 1
     fi
     log "Found ${#vms[@]} VMs in $VM_RG. Starting parallel exports."
     for v in "${vms[@]}"; do
-      export_vm_disks "$VM_RG" "$v" &
+      ( VM_LOG_FILE=$(mktemp); export VM_LOG_FILE; export_vm_disks "$VM_RG" "$v" ) &
     done
     wait
   else
     log "Discovering all VMs in subscription"
     list_url="${ARM_BASE}/subscriptions/${SUBSCRIPTION}/providers/Microsoft.Compute/virtualMachines?api-version=${ARM_API_VERSION_VM}"
     vm_list=$(auth_get "$list_url")
-    mapfile -t vms_rg < <(echo "$vm_list" | jq -r '.value[].id | capture("(?<rg>resourceGroups/(?<name>[^/]+))") | .name')
-    mapfile -t vms_name < <(echo "$vm_list" | jq -r '.value[].name')
+    if [[ -n "$VM_TAG_FILTER" ]]; then
+      mapfile -t vms_rg < <(echo "$vm_list" | jq -r --arg filters "$VM_TAG_FILTER" '
+        def parse_filters($s): if ($s|length)==0 then {} else ($s | split(" ") | map(split("=")) | from_entries) end;
+        .value[] | select((parse_filters($filters)) as $f | ($f|keys) as $ks | all($ks[]; (.tags[.] == $f[.]))) | (.id | capture("/resourceGroups/(?<rg>[^/]+)/").rg)
+      ')
+      mapfile -t vms_name < <(echo "$vm_list" | jq -r --arg filters "$VM_TAG_FILTER" '
+        def parse_filters($s): if ($s|length)==0 then {} else ($s | split(" ") | map(split("=")) | from_entries) end;
+        .value[] | select((parse_filters($filters)) as $f | ($f|keys) as $ks | all($ks[]; (.tags[.] == $f[.]))) | .name
+      ')
+    else
+      mapfile -t vms_rg < <(echo "$vm_list" | jq -r '.value[].id | capture("(?<rg>resourceGroups/(?<name>[^/]+))") | .name')
+      mapfile -t vms_name < <(echo "$vm_list" | jq -r '.value[].name')
+    fi
     if [[ ${#vms_name[@]} -eq 0 ]]; then
       err "No VMs found in subscription"
       exit 1
@@ -336,7 +397,7 @@ else
     for i in "${!vms_name[@]}"; do
       # Extract resource group name from id reliably
       rg=$(echo "$vm_list" | jq -r --arg idx "$i" '.value[($idx|tonumber)].id | capture("/resourceGroups/(?<rg>[^/]+)/") | .rg')
-      export_vm_disks "$rg" "${vms_name[$i]}" &
+      ( VM_LOG_FILE=$(mktemp); export VM_LOG_FILE; export_vm_disks "$rg" "${vms_name[$i]}" ) &
     done
     wait
   fi
