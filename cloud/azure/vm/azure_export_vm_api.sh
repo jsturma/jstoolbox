@@ -3,35 +3,13 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Export all disks (OS + data) of an Azure VM to a Storage Account container based on snapshots.
-
-Requirements:
-- Only REST is used (curl-based). No Azure CLI required.
-- AAD App registration with appropriate permissions:
-  - ARM: Microsoft.Compute snapshots/disks/VM read+write
-  - Storage data-plane: Blob Data Contributor (or higher) on the target account
-- Environment variables for client credentials:
-  - AZ_TENANT_ID, AZ_CLIENT_ID, AZ_CLIENT_SECRET
-
+Export Azure VMs (disks + config) to Storage via REST only.
+Required: AZ_TENANT_ID, AZ_CLIENT_ID, AZ_CLIENT_SECRET (or AZ_ARM_TOKEN/AZ_STORAGE_TOKEN).
 Usage:
-  azure_export_vm_api.sh \
-    --resource-group <vm_rg> \
-    --vm-name <vm_name> \
-    --storage-account <account_name> \
-    --storage-container <container_name> \
-    [--subscription <sub_id_or_name>] \
-    [--snapshot-resource-group <rg_for_snapshots>] \
-    [--sas-hours <hours>] \
-    [--delete-snapshots true|false] \
-    [--tags "k1=v1 k2=v2"]
-
-Notes:
-- Snapshots are created per attached managed disk; each snapshot is exported as a VHD blob.
-- Exports use temporary SAS from snapshots and server-side copy to the destination container.
-- When --delete-snapshots=true, snapshots will be removed after copy completes.
-Notes on auth:
-- Tokens are acquired via client credentials. Optionally pre-supply tokens:
-  - AZ_ARM_TOKEN for ARM; AZ_STORAGE_TOKEN for Blob service.
+  azure_export_vm_api.sh --subscription SUB --storage-account ACC --storage-container CTR \
+    [--resource-group RG] [--vm-name VM] [--vm-tag-filter "k=v k2=v2"] \
+    [--snapshot-resource-group RG] [--sas-hours N] [--delete-snapshots true|false] \
+    [--tags "k=v ..."]
 EOF
 }
 

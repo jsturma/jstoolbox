@@ -1,6 +1,9 @@
-## Azure VM Export (REST-only)
+## Azure VM Export (REST and CLI)
 
-This script snapshots all managed disks (OS + data) attached to one or more Azure VMs and exports them as VHDs to a Storage Account container. It also uploads each VM's full ARM configuration JSON. All operations use REST (curl) with OAuth tokens; no Azure CLI is required.
+These scripts snapshot all managed disks (OS + data) attached to one or more Azure VMs and export them as VHDs to a Storage Account container. They also upload each VM's full ARM configuration JSON and per-VM export logs. Two variants are provided:
+
+- `azure_export_vm_api.sh`: REST-only (curl + OAuth), no Azure CLI required.
+- `azure_export_vm_cli.sh`: Azure CLI–only, no direct REST calls.
 
 ### Features
 - REST-only: uses OAuth2 and Azure ARM/Blob REST APIs
@@ -14,13 +17,13 @@ This script snapshots all managed disks (OS + data) attached to one or more Azur
   - All VMs in a resource group
   - All VMs in a subscription
 
-### Requirements
+### Requirements (REST script)
 - `curl` and `jq`
 - Azure AD App Registration or Managed Identity equivalent with:
   - Compute (ARM): read VM, read disks; create/delete snapshots; grant/revoke snapshot access
   - Storage (data plane): Blob Data Contributor (or higher) on the destination Storage Account
 
-### Authentication
+### Authentication (REST script)
 Set either tokens or client credentials as environment variables:
 
 - Tokens (optional, if you already obtained them):
@@ -32,7 +35,7 @@ Set either tokens or client credentials as environment variables:
   - `AZ_CLIENT_ID`
   - `AZ_CLIENT_SECRET`
 
-### Usage
+### Usage (REST script)
 ```
 azure_export_vm_api.sh \
   --subscription <sub_id_or_name> \
@@ -47,7 +50,7 @@ azure_export_vm_api.sh \
   [--tags "k1=v1 k2=v2"]
 ```
 
-### Parameters
+### Parameters (both scripts unless noted)
 - **--subscription**: Azure subscription ID or name. Required. Used for ARM requests and VM discovery.
 - **--storage-account**: Destination Storage Account name for exports. Required.
 - **--storage-container**: Destination container name within the Storage Account. Required. Created if missing.
@@ -59,19 +62,19 @@ azure_export_vm_api.sh \
 - **--delete-snapshots**: Whether to delete snapshots after the copy completes. Optional. Values: `true` or `false`. Default: `false`.
 - **--tags**: Space-delimited list of `key=value` tags applied to created snapshots. Optional. Example: `--tags "project=backup env=prod"`.
 
-### Environment variables
+### Environment variables (REST script only)
 - **AZ_ARM_TOKEN**: Optional bearer token for ARM (`https://management.azure.com/.default`). If not set, the script uses client credentials.
 - **AZ_STORAGE_TOKEN**: Optional bearer token for Storage (`https://storage.azure.com/.default`). If not set, the script uses client credentials.
 - **AZ_TENANT_ID**: Tenant ID for OAuth2 client credentials. Required if `AZ_ARM_TOKEN`/`AZ_STORAGE_TOKEN` are not provided.
 - **AZ_CLIENT_ID**: Client ID for OAuth2 client credentials. Required if tokens are not provided.
 - **AZ_CLIENT_SECRET**: Client secret for OAuth2 client credentials. Required if tokens are not provided.
 
-### Behavior by scope
+### Behavior by scope (both scripts)
 - Single VM: provide `--vm-name` and `--resource-group`.
 - All VMs in a resource group: provide `--resource-group`, omit `--vm-name`.
 - All VMs in subscription: omit both `--resource-group` and `--vm-name`.
 
-### Examples
+### Examples (REST script)
 - Single VM
 ```bash
 AZ_TENANT_ID=... AZ_CLIENT_ID=... AZ_CLIENT_SECRET=... \
@@ -105,19 +108,73 @@ AZ_TENANT_ID=... AZ_CLIENT_ID=... AZ_CLIENT_SECRET=... \
   --storage-container "vhds-backups"
 ```
 
-### Outputs
+### Outputs (both scripts)
 - Artifacts are stored under a per-VM, timestamped virtual subdirectory: `/<vm>/<timestamp>/...`
 - Per VM directory contents:
   - `config.json` (full ARM VM model)
   - One VHD blob per disk: `<disk>.vhd`
   - `export.log` (logs from the export process for that VM)
 
-### Notes
+### Notes (both scripts)
 - Snapshots are created in `--snapshot-resource-group` (defaults to VM RG). Use `--delete-snapshots true` to clean them up after copy.
 - Copy uses `x-ms-copy-source` from the snapshot SAS to the destination page blob.
 - Ensure the destination container exists or let the script create it.
 
 ### Limitations
 - Classic (ASM) VMs are not supported by ARM. If you still have classic VMs, adapt a legacy flow that enumerates their page blobs and copies them directly.
+---
 
+## Azure VM Export (CLI-only)
 
+`azure_export_vm_cli.sh` performs the same operations using only the Azure CLI.
+
+### Requirements (CLI script)
+- Azure CLI logged in (`az login`), with:
+  - Compute: read VM/disks; create/delete snapshots; grant/revoke snapshot access
+  - Storage: Blob Data Contributor (or higher) on destination account
+- Optional: `jq` (pretty prints VM config before upload)
+
+### Usage (CLI script)
+```
+azure_export_vm_cli.sh \
+  --subscription <sub_id_or_name> \
+  --storage-account <account_name> \
+  --storage-container <container_name> \
+  [--resource-group <vm_rg>] \
+  [--vm-name <vm_name>] \
+  [--vm-tag-filter "k=v k2=v2"] \
+  [--snapshot-resource-group <rg_for_snapshots>] \
+  [--sas-hours <hours>] \
+  [--delete-snapshots true|false] \
+  [--tags "k1=v1 k2=v2"]
+```
+
+### Examples (CLI script)
+- Single VM
+```bash
+./azure_export_vm_cli.sh \
+  --subscription "SUB_ID" \
+  --resource-group "VM_RG" \
+  --vm-name "VM_NAME" \
+  --storage-account "STG_ACCOUNT" \
+  --storage-container "vhds-backups" \
+  --delete-snapshots true
+```
+
+- All VMs in a resource group with tag filter
+```bash
+./azure_export_vm_cli.sh \
+  --subscription "SUB_ID" \
+  --resource-group "VM_RG" \
+  --storage-account "STG_ACCOUNT" \
+  --storage-container "vhds-backups" \
+  --vm-tag-filter "env=prod project=appX"
+```
+
+- All VMs in a subscription
+```bash
+./azure_export_vm_cli.sh \
+  --subscription "SUB_ID" \
+  --storage-account "STG_ACCOUNT" \
+  --storage-container "vhds-backups"
+```
