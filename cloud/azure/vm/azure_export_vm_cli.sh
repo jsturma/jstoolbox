@@ -10,6 +10,7 @@ Features:
 - Per-VM timestamped subdirectory: <vm>/<timestamp>/
 - Exports all managed disks (OS + data) using snapshots and server-side copy
 - Uploads VM config (config.json) and per-VM export log (export.log)
+- Optional on-premise replication: download all exports to local path
 - Parallel: VMs in parallel, disks per VM in parallel
 
 Prereqs:
@@ -27,7 +28,8 @@ Usage:
     [--snapshot-resource-group <rg_for_snapshots>] \
     [--sas-hours <hours>] \
     [--delete-snapshots true|false] \
-    [--tags "k1=v1 k2=v2"]
+    [--tags "k1=v1 k2=v2"] \
+    [--replicate-to <local_path>]
 EOF
 }
 
@@ -55,6 +57,7 @@ SAS_HOURS=6
 DELETE_SNAPSHOTS="false"
 TAGS=""
 VM_TAG_FILTER=""
+REPLICATE_TO=""
 
 if [[ $# -eq 0 ]]; then usage; exit 1; fi
 
@@ -70,6 +73,7 @@ while [[ $# -gt 0 ]]; do
     --delete-snapshots) DELETE_SNAPSHOTS="$2"; shift 2 ;;
     --vm-tag-filter) VM_TAG_FILTER="$2"; shift 2 ;;
     --tags) TAGS="$2"; shift 2 ;;
+    --replicate-to) REPLICATE_TO="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) err "Unknown argument: $1"; usage; exit 1 ;;
   esac
@@ -181,6 +185,39 @@ export_disk() {
   fi
 }
 
+replicate_to_onpremise() {
+  local local_path="$1"
+  log "Starting on-premise replication to: $local_path"
+  if [[ ! -d "$local_path" ]]; then
+    mkdir -p "$local_path" || { err "Failed to create directory: $local_path"; return 1; }
+  fi
+  log "Listing all blobs in container: $SA_CONTAINER"
+  mapfile -t blob_names < <(az storage blob list --account-name "$SA_NAME" --container-name "$SA_CONTAINER" --auth-mode login --query "[].name" -o tsv)
+  if [[ ${#blob_names[@]} -eq 0 ]]; then
+    log "No blobs found to replicate"
+    return 0
+  fi
+  log "Found ${#blob_names[@]} blobs. Downloading in parallel..."
+  for blob_name in "${blob_names[@]}"; do
+    local dest_file="${local_path}/${blob_name}"
+    local dest_dir
+    dest_dir=$(dirname "$dest_file")
+    mkdir -p "$dest_dir" || true
+    (
+      log "Downloading: $blob_name -> $dest_file"
+      az storage blob download \
+        --account-name "$SA_NAME" \
+        --container-name "$SA_CONTAINER" \
+        --name "$blob_name" \
+        --file "$dest_file" \
+        --auth-mode login \
+        --no-progress >/dev/null 2>&1 || err "Failed to download: $blob_name"
+    ) &
+  done
+  wait
+  log "On-premise replication completed. Local path: $local_path"
+}
+
 export_vm() {
   local vm_rg="$1"; local vm_name="$2"
   VM_LOG_FILE=${VM_LOG_FILE:-$(mktemp)}
@@ -249,5 +286,9 @@ else
 fi
 
 log "Export completed. Destination: account=$SA_NAME container=$SA_CONTAINER"
+
+if [[ -n "$REPLICATE_TO" ]]; then
+  replicate_to_onpremise "$REPLICATE_TO"
+fi
 
 

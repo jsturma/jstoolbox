@@ -9,7 +9,7 @@ Usage:
   azure_export_vm_api.sh --subscription SUB --storage-account ACC --storage-container CTR \
     [--resource-group RG] [--vm-name VM] [--vm-tag-filter "k=v k2=v2"] \
     [--snapshot-resource-group RG] [--sas-hours N] [--delete-snapshots true|false] \
-    [--tags "k=v ..."]
+    [--tags "k=v ..."] [--replicate-to <local_path>]
 EOF
 }
 
@@ -37,6 +37,7 @@ SAS_HOURS=6
 DELETE_SNAPSHOTS="false"
 TAGS=""
 VM_TAG_FILTER=""
+REPLICATE_TO=""
 
 if [[ $# -eq 0 ]]; then
   usage
@@ -65,6 +66,8 @@ while [[ $# -gt 0 ]]; do
       TAGS="$2"; shift 2 ;;
     --vm-tag-filter)
       VM_TAG_FILTER="$2"; shift 2 ;;
+    --replicate-to)
+      REPLICATE_TO="$2"; shift 2 ;;
     -h|--help)
       usage; exit 0 ;;
     *)
@@ -251,6 +254,37 @@ export_disk() {
   fi
 }
 
+replicate_to_onpremise() {
+  local local_path="$1"
+  log "Starting on-premise replication to: $local_path"
+  if [[ ! -d "$local_path" ]]; then
+    mkdir -p "$local_path" || { err "Failed to create directory: $local_path"; return 1; }
+  fi
+  log "Listing all blobs in container: $SA_CONTAINER"
+  local list_url="https://${SA_NAME}.blob.core.windows.net/${SA_CONTAINER}?comp=list&restype=container"
+  local list_xml
+  list_xml=$(blob_request GET "$list_url")
+  mapfile -t blob_names < <(echo "$list_xml" | sed -n 's/.*<Name>\(.*\)<\/Name>.*/\1/p' || true)
+  if [[ ${#blob_names[@]} -eq 0 ]]; then
+    log "No blobs found to replicate"
+    return 0
+  fi
+  log "Found ${#blob_names[@]} blobs. Downloading in parallel..."
+  for blob_name in "${blob_names[@]}"; do
+    local dest_file="${local_path}/${blob_name}"
+    local dest_dir
+    dest_dir=$(dirname "$dest_file")
+    mkdir -p "$dest_dir" || true
+    (
+      log "Downloading: $blob_name -> $dest_file"
+      local blob_url="https://${SA_NAME}.blob.core.windows.net/${SA_CONTAINER}/${blob_name}"
+      blob_request GET "$blob_url" -o "$dest_file" >/dev/null 2>&1 || err "Failed to download: $blob_name"
+    ) &
+  done
+  wait
+  log "On-premise replication completed. Local path: $local_path"
+}
+
 export_vm_disks() {
   local vm_rg="$1"
   local vm_name="$2"
@@ -383,4 +417,8 @@ else
 fi
 
 log "Export completed. Destination: account=$SA_NAME container=$SA_CONTAINER"
+
+if [[ -n "$REPLICATE_TO" ]]; then
+  replicate_to_onpremise "$REPLICATE_TO"
+fi
 

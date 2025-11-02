@@ -9,6 +9,7 @@ These scripts snapshot all managed disks (OS + data) attached to one or more Azu
 - REST-only: uses OAuth2 and Azure ARM/Blob REST APIs
 - Snapshots each managed disk and performs server-side copy to Blob Storage
 - Uploads VM configuration JSON to the same container
+- Optional on-premise replication: download all exports to local path
 - Parallelism:
   - Per-VM: multiple VMs export concurrently
   - Per-disk: disks on a VM export concurrently
@@ -47,7 +48,8 @@ azure_export_vm_api.sh \
   [--snapshot-resource-group <rg_for_snapshots>] \
   [--sas-hours <hours>] \
   [--delete-snapshots true|false] \
-  [--tags "k1=v1 k2=v2"]
+  [--tags "k1=v1 k2=v2"] \
+  [--replicate-to <local_path>]
 ```
 
 ### Parameters (both scripts unless noted)
@@ -61,6 +63,7 @@ azure_export_vm_api.sh \
 - **--sas-hours**: Lifetime, in hours, of the temporary SAS granted on snapshots for copy. Optional. Default: 6.
 - **--delete-snapshots**: Whether to delete snapshots after the copy completes. Optional. Values: `true` or `false`. Default: `false`.
 - **--tags**: Space-delimited list of `key=value` tags applied to created snapshots. Optional. Example: `--tags "project=backup env=prod"`.
+- **--replicate-to**: Local directory path for on-premise replication. If provided, after all exports complete, downloads all blobs from the container to the specified local path, maintaining the same `vm/timestamp/` directory structure. Optional.
 
 ### Environment variables (REST script only)
 - **AZ_ARM_TOKEN**: Optional bearer token for ARM (`https://management.azure.com/.default`). If not set, the script uses client credentials.
@@ -108,6 +111,16 @@ AZ_TENANT_ID=... AZ_CLIENT_ID=... AZ_CLIENT_SECRET=... \
   --storage-container "vhds-backups"
 ```
 
+- Export with on-premise replication
+```bash
+AZ_TENANT_ID=... AZ_CLIENT_ID=... AZ_CLIENT_SECRET=... \
+./azure_export_vm_api.sh \
+  --subscription "SUB_ID" \
+  --storage-account "STG_ACCOUNT" \
+  --storage-container "vhds-backups" \
+  --replicate-to "/backups/azure-vms"
+```
+
 ### Outputs (both scripts)
 - Artifacts are stored under a per-VM, timestamped virtual subdirectory: `/<vm>/<timestamp>/...`
 - Per VM directory contents:
@@ -119,6 +132,7 @@ AZ_TENANT_ID=... AZ_CLIENT_ID=... AZ_CLIENT_SECRET=... \
 - Snapshots are created in `--snapshot-resource-group` (defaults to VM RG). Use `--delete-snapshots true` to clean them up after copy.
 - Copy uses `x-ms-copy-source` from the snapshot SAS to the destination page blob.
 - Ensure the destination container exists or let the script create it.
+- On-premise replication (`--replicate-to`) downloads all exported blobs after export completes, maintaining the same directory structure. Downloads run in parallel for efficiency.
 
 ### Limitations
 - Classic (ASM) VMs are not supported by ARM. If you still have classic VMs, adapt a legacy flow that enumerates their page blobs and copies them directly.
@@ -146,7 +160,8 @@ azure_export_vm_cli.sh \
   [--snapshot-resource-group <rg_for_snapshots>] \
   [--sas-hours <hours>] \
   [--delete-snapshots true|false] \
-  [--tags "k1=v1 k2=v2"]
+  [--tags "k1=v1 k2=v2"] \
+  [--replicate-to <local_path>]
 ```
 
 ### Examples (CLI script)
@@ -177,4 +192,13 @@ azure_export_vm_cli.sh \
   --subscription "SUB_ID" \
   --storage-account "STG_ACCOUNT" \
   --storage-container "vhds-backups"
+```
+
+- Export with on-premise replication
+```bash
+./azure_export_vm_cli.sh \
+  --subscription "SUB_ID" \
+  --storage-account "STG_ACCOUNT" \
+  --storage-container "vhds-backups" \
+  --replicate-to "/backups/azure-vms"
 ```
